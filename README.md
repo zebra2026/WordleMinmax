@@ -1,0 +1,2 @@
+# WordleMinmax
+Wordle Minmax Analyzer
