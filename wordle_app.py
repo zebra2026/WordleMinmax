@@ -55,7 +55,49 @@ v1.0 — Initial Streamlit UI
     widgets throughout. Board tiles are the only remaining use of
     st.markdown(unsafe_allow_html=True), using inline styles only.
 
-v1.1 — Column order, widths, and horizontal scroll
+v1.2 — Tile display, copy buttons, iOS keyboard, multi-guess fix
+    INPUT REDESIGN (hybrid approach — reliable across all platforms):
+      The input widget uses a two-layer architecture:
+        Layer 1 (visual): st.markdown renders 5 colored tiles showing
+          the current letter and color state — purely cosmetic, no
+          data flow through this layer.
+        Layer 2 (data): st.text_input captures the typed word via
+          Streamlit's WebSocket, preserving session state across
+          reruns. Five st.button widgets cycle each tile's color.
+          Submit button triggers engine processing.
+      This hybrid avoids the session-state-wipe bug caused by
+      location.reload() in the earlier pure-JS approach, where
+      full browser reloads destroyed Streamlit session state after
+      the first guess.
+
+    TILE COLOR CYCLE BEHAVIOR:
+      ⬛ Gray → 🟨 Yellow → 🟩 Green → clears letter (resets to gray)
+      Matches Wordlewise behavior — clicking green removes the letter.
+
+    COPY BUTTONS:
+      📋 Copy button added below the ranking table and bucket detail
+      table. Text is base64-encoded in Python before passing to JS
+      (avoids unicode escape issues with emoji and special chars).
+      Button label briefly shows ✅ Copied! on success.
+      Ranking copy: fixed-width plain text table with ASCII dashes.
+      Bucket detail copy: pattern + size + odds + words per line.
+
+    DUPLICATE ROW FIX (Both lists mode):
+      The OG cfreshman allowed list overlaps with the answer list —
+      all 2315 answer words appear in both files. Merged table now
+      deduplicates by word (keeping Answer-tagged row), preventing
+      every answer-list word from appearing twice.
+
+    iOS CHROME COLUMN TOGGLE FIX:
+      Added unique key= to both ranking dataframes so Streamlit
+      creates a fresh widget on toggle rather than reusing the old
+      one, which caused columns to disappear on iOS Chrome.
+
+    WORD LIST CHANGE (engine v1.5):
+      Switched allowed list from NYT combined list (14855 words,
+      fully overlapping) to OG cfreshman list (~10657 words, truly
+      separate). Local filename changed to wordle-allowed-guesses.txt.
+
     PROBLEM: Rightmost column was clipped or hidden on narrower
     screens; vertical scrollbar consumed pixels from the last column
     in the 40-row merged table.
@@ -128,9 +170,10 @@ def reset_game():
     st.session_state.constraints  = {}
     st.session_state.answer_pool  = answer_list[:]
     st.session_state.guess_number = 1
-    st.session_state.board        = []   # list of (word, pattern_tuple)
+    st.session_state.board        = []
     st.session_state.solved       = False
-    st.session_state.tile_colors  = [0, 0, 0, 0, 0]   # 0=gray 1=yellow 2=green
+    st.session_state.tile_colors  = [0, 0, 0, 0, 0]
+    st.session_state.tile_letters = ["", "", "", "", ""]
     st.session_state.error_msg    = ""
 
 if "constraints" not in st.session_state:
@@ -141,8 +184,6 @@ if "constraints" not in st.session_state:
 # CONSTANTS
 # ─────────────────────────────────────────────────────────────────
 COLOR_CYCLE = {0: 1, 1: 2, 2: 0}          # gray → yellow → green → gray
-COLOR_EMOJI = {0: "⬛", 1: "🟨", 2: "🟩"}
-COLOR_NAME  = {0: "Gray", 1: "Yellow", 2: "Green"}
 
 
 # ─────────────────────────────────────────────────────────────────
@@ -184,46 +225,96 @@ with col_input:
     else:
         st.subheader(f"Guess {st.session_state.guess_number} of 6")
 
-        # Word text input
-        word_input = st.text_input(
+        # ── RELIABLE HYBRID INPUT ──
+        # Architecture: Streamlit owns all state. The JS component is purely
+        # cosmetic — it displays colored tiles. The actual data source is:
+        #   - st.text_input  → the word (reliable on all platforms)
+        #   - st.button      → one per tile position, cycles color
+        #   - st.button      → Submit, triggers engine processing
+        #
+        # Why not a pure JS component?
+        #   Streamlit session state is wiped on full page reloads.
+        #   Using location.reload() as a JS→Streamlit bridge causes the
+        #   board to reset after every guess. st.text_input + st.button
+        #   use Streamlit's WebSocket, which preserves session state.
+        #
+        # The tile display above the text input mirrors the typed letters
+        # and current colors purely for visual feedback — it does not
+        # affect the data flow.
+
+        tile_letters = list(st.session_state.tile_letters)
+        tile_colors  = list(st.session_state.tile_colors)
+        COLOR_BG     = {0: "#787c7e", 1: "#b59f3b", 2: "#538d4e"}
+
+        # ── Colored tile display (visual only) ──
+        tile_html = "".join(
+            f'<div style="width:56px;height:56px;border-radius:6px;'
+            f'background:{COLOR_BG[tile_colors[i]]};'
+            f'display:flex;align-items:center;justify-content:center;'
+            f'font-size:1.6rem;font-weight:700;color:white;'
+            f'border:3px solid {"#aaa" if not tile_letters[i] else COLOR_BG[tile_colors[i]]};">'
+            f'{tile_letters[i].upper() if tile_letters[i] else ""}</div>'
+            for i in range(5)
+        )
+        st.markdown(
+            f'<div style="display:flex;gap:8px;justify-content:center;'
+            f'margin-bottom:10px;">{tile_html}</div>',
+            unsafe_allow_html=True
+        )
+
+        # ── Word text input ──
+        # Single text field — works reliably on iOS, Android, desktop.
+        # Letters typed here are reflected in the tile display above.
+        word_val = st.text_input(
             "Word",
-            placeholder="e.g. RAISE",
+            value="".join(tile_letters).strip(),
             max_chars=5,
+            placeholder="Type your 5-letter guess…",
             label_visibility="collapsed",
-            key="word_text_input",
+            key="word_input",
         ).strip().lower()
 
-        # Tile color buttons — each click cycles one position's color
-        st.caption("Click each tile to cycle: ⬛ Gray → 🟨 Yellow → 🟩 Green")
-        tile_cols = st.columns(5)
-        for i, tc in enumerate(tile_cols):
-            with tc:
-                color = st.session_state.tile_colors[i]
-                if st.button(
-                    COLOR_EMOJI[color],
-                    key=f"tile_{i}",
-                    help=f"Position {i+1}: {COLOR_NAME[color]} — click to cycle",
-                    use_container_width=True,
-                ):
-                    st.session_state.tile_colors[i] = COLOR_CYCLE[color]
+        # Sync letters from text input → session state → tile display
+        padded = list((word_val + "     ")[:5])
+        padded = [c if c.strip() else "" for c in padded]
+        st.session_state.tile_letters = padded
+
+        # ── Color cycle buttons ──
+        # One per tile position. Clicking cycles Gray→Yellow→Green→clears.
+        st.caption("Click to cycle: ⬛ Gray → 🟨 Yellow → 🟩 Green → clears letter")
+        btn_cols = st.columns(5)
+        COLOR_LABELS = {0: "⬛", 1: "🟨", 2: "🟩"}
+        for i, bc in enumerate(btn_cols):
+            with bc:
+                color = tile_colors[i]
+                if st.button(COLOR_LABELS[color], key=f"color_{i}",
+                             use_container_width=True):
+                    if color == 2:
+                        # Green → clear letter AND reset to gray
+                        new_letters = list(st.session_state.tile_letters)
+                        new_letters[i] = ""
+                        st.session_state.tile_letters = new_letters
+                        st.session_state.tile_colors[i] = 0
+                    else:
+                        st.session_state.tile_colors[i] = color + 1
                     st.rerun()
 
         if st.session_state.get("error_msg"):
             st.error(st.session_state.error_msg)
             st.session_state.error_msg = ""
 
-        # Submit button
+        # ── Submit ──
         if st.button("▶ Submit Guess", type="primary", use_container_width=True):
-            w = word_input
+            w = word_val
             p = tuple(st.session_state.tile_colors)
 
             if len(w) != 5 or not w.isalpha():
                 st.session_state.error_msg = "Enter a valid 5-letter word."
             elif all(c == 2 for c in p):
-                # All green = solved
                 st.session_state.board.append((w, p))
                 st.session_state.solved = True
-                st.session_state.tile_colors = [0, 0, 0, 0, 0]
+                st.session_state.tile_colors  = [0, 0, 0, 0, 0]
+                st.session_state.tile_letters = ["", "", "", "", ""]
             else:
                 engine.update_constraints(st.session_state.constraints, w, p)
                 st.session_state.answer_pool = engine.filter_candidates(
@@ -231,7 +322,8 @@ with col_input:
                 )
                 st.session_state.board.append((w, p))
                 st.session_state.guess_number += 1
-                st.session_state.tile_colors = [0, 0, 0, 0, 0]
+                st.session_state.tile_colors  = [0, 0, 0, 0, 0]
+                st.session_state.tile_letters = ["", "", "", "", ""]
             st.rerun()
 
     if st.button("↺ New Game"):
@@ -299,6 +391,64 @@ def ranking_to_rows(ranking, candidate_set, source_label=None):
         rows.append(row)
     return rows
 
+def copy_button(text, label="📋 Copy to clipboard"):
+    """
+    Renders a clipboard copy button via st.components.v1.html.
+    The text is base64-encoded to avoid any JS escaping issues with
+    special characters (emoji, dashes, etc.).
+    """
+    import base64
+    b64 = base64.b64encode(text.encode("utf-8")).decode("ascii")
+    st.components.v1.html(f"""
+    <button id="cb" style="padding:6px 14px;border:1px solid #ccc;
+      border-radius:5px;background:#f8f9fa;cursor:pointer;
+      font-size:0.85rem;color:#1a1a2e;margin-top:4px;">
+      {label}
+    </button>
+    <script>
+      document.getElementById('cb').addEventListener('click', function() {{
+        var b64 = "{b64}";
+        var txt = decodeURIComponent(escape(atob(b64)));
+        var btn = this;
+        if (navigator.clipboard) {{
+          navigator.clipboard.writeText(txt).then(function() {{
+            btn.textContent = '✅ Copied!';
+            setTimeout(function() {{ btn.textContent = '{label}'; }}, 2000);
+          }});
+        }} else {{
+          var ta = document.createElement('textarea');
+          ta.value = txt;
+          document.body.appendChild(ta);
+          ta.select();
+          document.execCommand('copy');
+          document.body.removeChild(ta);
+          btn.textContent = '✅ Copied!';
+          setTimeout(function() {{ btn.textContent = '{label}'; }}, 2000);
+        }}
+      }});
+    </script>
+    """, height=44)
+
+
+def df_to_copy_text(df, title=""):
+    """
+    Convert a DataFrame to a clean plain-text table for pasting into
+    ChatGPT / Gemini. Uses ASCII dashes to avoid unicode escape issues.
+    """
+    lines = []
+    if title:
+        lines.append(title)
+        lines.append("-" * len(title))
+    cols   = list(df.columns)
+    widths = [max(len(str(c)), max((len(str(v)) for v in df[c]), default=0))
+              for c in cols]
+    lines.append("  ".join(str(c).ljust(w) for c, w in zip(cols, widths)))
+    lines.append("  ".join("-" * w for w in widths))
+    for _, row in df.iterrows():
+        lines.append("  ".join(str(row[c]).ljust(w) for c, w in zip(cols, widths)))
+    return "\n".join(lines)
+
+
 candidate_set = set(answer_pool)
 
 with st.spinner("Computing answer-list ranking…"):
@@ -335,8 +485,9 @@ if ranking_source == "Answer list only":
         hide_index=True,
         height=TABLE_HEIGHT,
         column_config=RANKING_COL_CONFIG,
-        key="ranking_df_answers",     # unique key — forces fresh render on toggle
+        key="ranking_df_answers",
     )
+    copy_button(df_to_copy_text(df, "Rankings — Answer list"))
 
 else:
     with st.spinner("Computing allowed-list ranking…"):
@@ -383,8 +534,9 @@ else:
         hide_index=True,
         height=TABLE_HEIGHT,
         column_config=RANKING_COL_CONFIG,
-        key="ranking_df_merged",      # unique key — forces fresh render on toggle
+        key="ranking_df_merged",
     )
+    copy_button(df_to_copy_text(merged_df, "Rankings — Both lists"))
 
 st.divider()
 
@@ -411,21 +563,28 @@ if detail_word:
         sp      = nb / total * 100
         gp      = sum(len(v) for _, v in buckets if len(v) > 5) / total * 100
 
-        st.caption(
-            f"**{detail_word.upper()}** — {nb} buckets · "
-            f"worst-case={wc} · unique={unique} · "
-            f"Solve%={sp:.1f}% · P(>5)={gp:.1f}%"
-        )
+        summary = (f"{detail_word.upper()} — {nb} buckets · "
+                   f"worst-case={wc} · unique={unique} · "
+                   f"Solve%={sp:.1f}% · P(>5)={gp:.1f}%")
+        st.caption(f"**{detail_word.upper()}** — {nb} buckets · "
+                   f"worst-case={wc} · unique={unique} · "
+                   f"Solve%={sp:.1f}% · P(>5)={gp:.1f}%")
 
         bucket_rows = []
+        copy_lines  = [summary, "-" * len(summary)]
         for p, words in buckets:
-            size = len(words)
+            size     = len(words)
+            odds     = "certain!" if size == 1 else f"1-in-{size}"
+            word_str = " ".join(w.upper() for w in sorted(words))
             bucket_rows.append({
                 "Pattern" : engine.pattern_str(p),
                 "Size"    : size,
-                "Odds"    : "certain!" if size == 1 else f"1-in-{size}",
-                "Words"   : " ".join(w.upper() for w in sorted(words)),
+                "Odds"    : odds,
+                "Words"   : word_str,
             })
+            copy_lines.append(
+                f"{engine.pattern_str(p)}  {size:>4}  {odds:<12}  {word_str}"
+            )
 
         bucket_df = pd.DataFrame(bucket_rows)
         st.dataframe(
@@ -439,3 +598,5 @@ if detail_word:
                 "Words"  : st.column_config.TextColumn(width="large"),
             }
         )
+        copy_button("\n".join(copy_lines),
+                    label=f"📋 Copy {detail_word.upper()} bucket detail")
